@@ -25,6 +25,7 @@ Test the visualizer module.
 
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -180,6 +181,38 @@ class TestHeadlessVisualizer(unittest.TestCase):
         self.assertEqual(self.visualizer.video_format, "mp4")
         self.assertEqual(self.visualizer.renderer_spp, 64)
         self.assertEqual(self.visualizer.keep_frames, True)
+        self.assertEqual(self.visualizer.parallel_render_workers, 1)
+        self.assertFalse(self.visualizer.parallel_render_enabled)
+
+    def test_render_dispatch_uses_serial_by_default(self):
+        """
+        Test that serial rendering is used when parallel rendering is disabled.
+        """
+        with (
+            patch.object(self.visualizer, "_render_frames_serial") as serial_mock,
+            patch.object(self.visualizer, "_render_frames_parallel") as parallel_mock,
+        ):
+            self.visualizer.do_create_video = False
+            self.visualizer.parallel_render_enabled = False
+            self.visualizer._record_trajectory()
+
+        serial_mock.assert_called_once()
+        parallel_mock.assert_not_called()
+
+    def test_render_dispatch_uses_parallel_when_enabled(self):
+        """
+        Test that parallel rendering is used when explicitly enabled.
+        """
+        with (
+            patch.object(self.visualizer, "_render_frames_serial") as serial_mock,
+            patch.object(self.visualizer, "_render_frames_parallel") as parallel_mock,
+        ):
+            self.visualizer.do_create_video = False
+            self.visualizer.parallel_render_enabled = True
+            self.visualizer._record_trajectory()
+
+        parallel_mock.assert_called_once()
+        serial_mock.assert_not_called()
 
     def test_headless_rendering(self):
         """

@@ -77,6 +77,8 @@ class BaseVisualizer:
         renderer_resolution: typing.Sequence[int] | None = None,
         renderer_spp: int = 64,
         renderer: Mitsuba | None = None,
+        parallel_render_workers: int = 1,
+        parallel_render_enabled: bool = False,
     ):
         """
         Initialize the base visualizer.
@@ -109,6 +111,10 @@ class BaseVisualizer:
                 Samples per pixel for the rendered videos and screenshots.
         renderer : Mitsuba, optional
                 The renderer engine to use for rendering.
+        parallel_render_workers : int, optional
+                Number of worker processes to use for headless parallel rendering.
+        parallel_render_enabled : bool, optional
+                If True, enables headless parallel rendering.
         """
         self.particles = particles
         self.vector_field = vector_field
@@ -138,6 +144,8 @@ class BaseVisualizer:
         )
         self.renderer_spp = renderer_spp
         self.renderer = renderer or Mitsuba()
+        self.parallel_render_workers = max(1, int(parallel_render_workers))
+        self.parallel_render_enabled = parallel_render_enabled
 
         # Initialize video manager
         self.video_manager = VideoManager(

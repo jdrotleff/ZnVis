@@ -27,9 +27,11 @@ import znvis.cameras
 
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
+import multiprocessing
 import pathlib
 import time
 import typing
+from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 from rich.progress import Progress
@@ -38,6 +40,70 @@ import znvis
 from znvis import cameras
 from znvis.rendering import Mitsuba
 from znvis.visualizer.base_visualizer import BaseVisualizer
+
+_PARALLEL_RENDER_STATE = {}
+
+
+def _get_mesh_dict_for_frame(
+    particles: typing.List[znvis.Particle],
+    vector_field: typing.List[znvis.VectorField] | None,
+    frame_index: int,
+):
+    mesh_dict = {}
+    if vector_field is not None:
+        for item in vector_field:
+            idx = 0 if item.static else frame_index
+            mesh = (
+                item.mesh_list[idx]
+                if item.mesh_list is not None
+                else item.get_mesh_for_frame(frame_index)
+            )
+            mesh_dict[item.name] = {
+                "mesh": mesh,
+                "bsdf": item.mesh.material.mitsuba_bsdf,
+                "material": item.mesh.o3d_material,
+            }
+    for item in particles:
+        idx = 0 if item.static else frame_index
+        mesh = (
+            item.mesh_list[idx]
+            if item.mesh_list is not None
+            else item.get_mesh_for_frame(frame_index)
+        )
+        mesh_dict[item.name] = {
+            "mesh": mesh,
+            "bsdf": item.mesh.material.mitsuba_bsdf,
+            "material": item.mesh.o3d_material,
+        }
+    return mesh_dict
+
+
+def _render_frame_parallel_worker(frame_index: int) -> int:
+    state = _PARALLEL_RENDER_STATE
+    renderer = state.get("renderer")
+    if renderer is None:
+        renderer = Mitsuba()
+        state["renderer"] = renderer
+
+    mesh_dict = _get_mesh_dict_for_frame(
+        particles=state["particles"],
+        vector_field=state["vector_field"],
+        frame_index=frame_index,
+    )
+    if state["camera"] is not None:
+        view_matrix = state["camera"].get_view_matrix(frame_index)
+    else:
+        view_matrix = state["view_matrix"]
+
+    renderer.render_mesh_objects(
+        mesh_dict,
+        view_matrix,
+        save_dir=state["frame_folder"],
+        save_name=f"frame_{frame_index:0>6}.png",
+        resolution=state["renderer_resolution"],
+        samples_per_pixel=state["renderer_spp"],
+    )
+    return frame_index
 
 
 class Headless_Visualizer(BaseVisualizer):
@@ -69,6 +135,8 @@ class Headless_Visualizer(BaseVisualizer):
         renderer: Mitsuba | None = None,
         do_create_video: bool = True,
         camera: cameras.BaseCamera | None = None,
+        parallel_render_workers: int = 1,
+        parallel_render_enabled: bool = False,
     ):
         """
         Constructor for the visualizer.
@@ -105,6 +173,10 @@ class Headless_Visualizer(BaseVisualizer):
         camera : znvis.cameras.Camera object
                 Camera object to use for the visualization. If None, a default camera
                 will be used.
+        parallel_render_workers : int
+                Number of worker processes to use when parallel rendering is enabled.
+        parallel_render_enabled : bool
+                If True, render frames with a process pool.
         """
         # Call parent constructor
         super().__init__(
@@ -120,6 +192,8 @@ class Headless_Visualizer(BaseVisualizer):
             renderer_resolution=renderer_resolution,
             renderer_spp=renderer_spp,
             renderer=renderer,
+            parallel_render_workers=parallel_render_workers,
+            parallel_render_enabled=parallel_render_enabled,
         )
 
         # Headless-specific attributes
@@ -141,51 +215,76 @@ class Headless_Visualizer(BaseVisualizer):
                 [[1, 0, 0, -100], [0, 1, 0, -90], [0, 0, 1, -230], [0, 0, 0, 1]]
             )
 
+    def _render_frame(self, frame_index: int, renderer: Mitsuba | None = None):
+        mesh_dict = self.get_mesh_dict(frame_index)
+        view_matrix = (
+            self.camera.get_view_matrix(frame_index)
+            if self.camera is not None
+            else self.view_matrix
+        )
+        (renderer or self.renderer).render_mesh_objects(
+            mesh_dict,
+            view_matrix,
+            save_dir=self.frame_folder,
+            save_name=f"frame_{frame_index:0>6}.png",
+            resolution=self.renderer_resolution,
+            samples_per_pixel=self.renderer_spp,
+        )
+
+    def _render_frames_serial(self):
+        with Progress() as progress:
+            task = progress.add_task("Saving scenes...", total=self.number_of_steps)
+            for frame_index in range(self.number_of_steps):
+                self.counter = frame_index
+                self._render_frame(frame_index)
+                progress.update(task, advance=1)
+                time.sleep(1 / self.frame_rate)
+
+        self.counter = 0
+
+    def _render_frames_parallel(self):
+        if self.parallel_render_workers <= 1:
+            self._render_frames_serial()
+            return
+
+        try:
+            mp_context = multiprocessing.get_context("fork")
+        except ValueError:
+            self._render_frames_serial()
+            return
+
+        global _PARALLEL_RENDER_STATE
+        _PARALLEL_RENDER_STATE = {
+            "particles": self.particles,
+            "vector_field": self.vector_field,
+            "camera": self.camera,
+            "view_matrix": self.view_matrix,
+            "frame_folder": self.frame_folder,
+            "renderer_resolution": self.renderer_resolution,
+            "renderer_spp": self.renderer_spp,
+        }
+
+        with ProcessPoolExecutor(
+            max_workers=self.parallel_render_workers,
+            mp_context=mp_context,
+        ) as executor:
+            with Progress() as progress:
+                task = progress.add_task("Saving scenes...", total=self.number_of_steps)
+                for _ in executor.map(
+                    _render_frame_parallel_worker, range(self.number_of_steps)
+                ):
+                    progress.update(task, advance=1)
+
+        _PARALLEL_RENDER_STATE = {}
+
     def _record_trajectory(self):
         """
         Record the trajectory.
         """
-        self.update_thread_finished = True
-        self.save_thread_finished = True
-
-        def update_callable():
-            """
-            Function to be called on thread to update positions.
-            """
-            self._update_particles()
-            self.update_thread_finished = True
-
-        def save_callable():
-            """
-            Function to be called on thread to save image.
-            """
-            mesh_dict = self.get_mesh_dict()
-            # Check if the camera should be used for deciding on the view matrix
-            if self.camera is not None:
-                self.view_matrix = self.camera.get_view_matrix(self.counter)
-            self.renderer.render_mesh_objects(
-                mesh_dict,
-                self.view_matrix,
-                save_dir=self.frame_folder,
-                save_name=f"frame_{self.counter:0>6}.png",
-                resolution=self.renderer_resolution,
-                samples_per_pixel=self.renderer_spp,
-            )
-            self.save_thread_finished = True
-
-        with Progress() as progress:
-            task = progress.add_task("Saving scenes...", total=self.number_of_steps)
-            while not progress.finished:
-                time.sleep(1 / self.frame_rate)
-
-                if self.save_thread_finished and self.update_thread_finished:
-                    self.save_thread_finished = False
-                    save_callable()
-                    progress.update(task, advance=1)
-
-                if self.update_thread_finished:
-                    self.update_thread_finished = False
-                    update_callable()
+        if self.parallel_render_enabled:
+            self._render_frames_parallel()
+        else:
+            self._render_frames_serial()
 
         time.sleep(1)  # Ensure the last image is saved
         if self.do_create_video:
