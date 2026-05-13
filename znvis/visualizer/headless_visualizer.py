@@ -27,9 +27,8 @@ import znvis.cameras
 
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
-import multiprocessing
+import logging
 import pathlib
-import time
 import typing
 from concurrent.futures import ProcessPoolExecutor
 
@@ -41,6 +40,8 @@ from znvis import cameras
 from znvis.rendering import Mitsuba
 from znvis.visualizer.base_visualizer import BaseVisualizer
 
+logger = logging.getLogger(__name__)
+
 _PARALLEL_RENDER_STATE = {}
 
 
@@ -49,6 +50,23 @@ def _get_mesh_dict_for_frame(
     vector_field: typing.List[znvis.VectorField] | None,
     frame_index: int,
 ):
+    """
+    Build a mesh dictionary for a specific frame index.
+
+    Parameters
+    ----------
+    particles : list[znvis.Particle]
+            Particle objects to render.
+    vector_field : list[znvis.VectorField] | None
+            Optional vector field objects to render.
+    frame_index : int
+            Frame index to render.
+
+    Returns
+    -------
+    dict
+            Mesh dictionary compatible with the Mitsuba renderer.
+    """
     mesh_dict = {}
     if vector_field is not None:
         for item in vector_field:
@@ -79,6 +97,19 @@ def _get_mesh_dict_for_frame(
 
 
 def _render_frame_parallel_worker(frame_index: int) -> int:
+    """
+    Render one frame inside a worker process.
+
+    Parameters
+    ----------
+    frame_index : int
+            Frame index to render.
+
+    Returns
+    -------
+    int
+            The rendered frame index.
+    """
     state = _PARALLEL_RENDER_STATE
     renderer = state.get("renderer")
     if renderer is None:
@@ -104,6 +135,20 @@ def _render_frame_parallel_worker(frame_index: int) -> int:
         samples_per_pixel=state["renderer_spp"],
     )
     return frame_index
+
+
+def _initialize_parallel_worker(state: dict):
+    """
+    Initialize per-process rendering state for parallel worker execution.
+
+    Parameters
+    ----------
+    state : dict
+            Worker-local rendering state used by parallel frame workers.
+    """
+    global _PARALLEL_RENDER_STATE
+    _PARALLEL_RENDER_STATE = dict(state)
+    _PARALLEL_RENDER_STATE["renderer"] = None
 
 
 class Headless_Visualizer(BaseVisualizer):
@@ -216,7 +261,21 @@ class Headless_Visualizer(BaseVisualizer):
             )
 
     def _render_frame(self, frame_index: int, renderer: Mitsuba | None = None):
-        mesh_dict = self.get_mesh_dict(frame_index)
+        """
+        Render a single frame by index.
+
+        Parameters
+        ----------
+        frame_index : int
+                Frame index to render.
+        renderer : Mitsuba, optional
+                Renderer instance to use. Defaults to the visualizer renderer.
+        """
+        mesh_dict = _get_mesh_dict_for_frame(
+            particles=self.particles,
+            vector_field=self.vector_field,
+            frame_index=frame_index,
+        )
         view_matrix = (
             self.camera.get_view_matrix(frame_index)
             if self.camera is not None
@@ -232,29 +291,26 @@ class Headless_Visualizer(BaseVisualizer):
         )
 
     def _render_frames_serial(self):
+        """
+        Render all frames sequentially in the main process.
+        """
         with Progress() as progress:
             task = progress.add_task("Saving scenes...", total=self.number_of_steps)
             for frame_index in range(self.number_of_steps):
-                self.counter = frame_index
                 self._render_frame(frame_index)
                 progress.update(task, advance=1)
-                time.sleep(1 / self.frame_rate)
-
-        self.counter = 0
 
     def _render_frames_parallel(self):
-        if self.parallel_render_workers <= 1:
+        """
+        Render all frames with a process pool.
+
+        Falls back to serial rendering if parallel worker startup fails.
+        """
+        if self.parallel_render_workers == 1:
             self._render_frames_serial()
             return
 
-        try:
-            mp_context = multiprocessing.get_context("fork")
-        except ValueError:
-            self._render_frames_serial()
-            return
-
-        global _PARALLEL_RENDER_STATE
-        _PARALLEL_RENDER_STATE = {
+        worker_state = {
             "particles": self.particles,
             "vector_field": self.vector_field,
             "camera": self.camera,
@@ -264,18 +320,27 @@ class Headless_Visualizer(BaseVisualizer):
             "renderer_spp": self.renderer_spp,
         }
 
-        with ProcessPoolExecutor(
-            max_workers=self.parallel_render_workers,
-            mp_context=mp_context,
-        ) as executor:
-            with Progress() as progress:
-                task = progress.add_task("Saving scenes...", total=self.number_of_steps)
-                for _ in executor.map(
-                    _render_frame_parallel_worker, range(self.number_of_steps)
-                ):
-                    progress.update(task, advance=1)
-
-        _PARALLEL_RENDER_STATE = {}
+        try:
+            with ProcessPoolExecutor(
+                max_workers=self.parallel_render_workers,
+                initializer=_initialize_parallel_worker,
+                initargs=(worker_state,),
+            ) as executor:
+                with Progress() as progress:
+                    task = progress.add_task(
+                        "Saving scenes...", total=self.number_of_steps
+                    )
+                    for _ in executor.map(
+                        _render_frame_parallel_worker, range(self.number_of_steps)
+                    ):
+                        progress.update(task, advance=1)
+        except Exception:
+            logger.exception(
+                "Parallel rendering failed, likely due to worker initialization "
+                "or frame-state serialization. Falling back to serial rendering "
+                "for this run."
+            )
+            self._render_frames_serial()
 
     def _record_trajectory(self):
         """
@@ -286,7 +351,6 @@ class Headless_Visualizer(BaseVisualizer):
         else:
             self._render_frames_serial()
 
-        time.sleep(1)  # Ensure the last image is saved
         if self.do_create_video:
             self._create_movie()
 

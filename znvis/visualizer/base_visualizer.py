@@ -23,6 +23,7 @@ Base visualizer class with shared functionality.
 
 import pathlib
 import typing
+from numbers import Integral
 
 import znvis
 from znvis.rendering import Mitsuba
@@ -144,7 +145,18 @@ class BaseVisualizer:
         )
         self.renderer_spp = renderer_spp
         self.renderer = renderer or Mitsuba()
-        self.parallel_render_workers = max(1, int(parallel_render_workers))
+        if not isinstance(parallel_render_workers, Integral) or isinstance(
+            parallel_render_workers, bool
+        ):
+            raise ValueError(
+                "parallel_render_workers must be an integer (not a boolean) "
+                "greater than or equal to 1."
+            )
+        if parallel_render_workers < 1:
+            raise ValueError(
+                "parallel_render_workers must be greater than or equal to 1."
+            )
+        self.parallel_render_workers = int(parallel_render_workers)
         self.parallel_render_enabled = parallel_render_enabled
 
         # Initialize video manager
